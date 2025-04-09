@@ -1,0 +1,167 @@
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const path = require('path');
+const fsPromises = require('fs').promises;
+const fs = require('fs');  // For sync operations
+const multer = require('multer');
+const winston = require('winston');
+
+// Configure Winston logger
+const logger = winston.createLogger({
+	level: 'error',
+	format: winston.format.json(),
+	transports: [
+		new winston.transports.File({ filename: 'error.log' })
+	]
+});
+
+// Configure multer for handling file uploads
+const storage = multer.diskStorage({
+	destination: (req, file, cb) => {
+		cb(null, 'uploads/');
+	},
+	filename: (req, file, cb) => {
+		cb(null, file.originalname);
+	}
+});
+
+const upload = multer({
+	storage: storage,
+	fileFilter: (req, file, cb) => {
+		if (file.mimetype.startsWith('image/')) {
+			cb(null, true);
+		} else {
+			cb(new Error('Only image files are allowed!'), false);
+		}
+	}
+});
+
+const app = express();
+
+// Middleware
+app.use(helmet({
+	contentSecurityPolicy: {
+		directives: {
+			defaultSrc: ["'self'"],
+			scriptSrc: ["'self'", "'unsafe-inline'"],
+			styleSrc: ["'self'", "'unsafe-inline'"],
+			imgSrc: ["'self'", "data:", "blob:"],
+		},
+	},
+	crossOriginEmbedderPolicy: false
+}));
+app.use(cors());
+app.use(express.json());
+app.use(express.static('public'));
+app.use('/uploads', express.static('uploads'));
+
+// Utility Functions
+function validateVisitorData(data) {
+	const requiredFields = ['name', 'purpose', 'personToMeet', 'idType'];
+	for (const field of requiredFields) {
+		if (!data[field]) {
+			throw new Error(`Missing required field: ${field}`);
+		}
+	}
+}
+
+async function getNextSerialNumber() {
+	try {
+		const data = await fsPromises.readFile('data/visitors.json', 'utf8');
+		const visitors = JSON.parse(data);
+		if (visitors.length === 0) return '0001';
+		
+		const lastSerial = visitors[visitors.length - 1].serialNumber;
+		const nextNum = parseInt(lastSerial) + 1;
+		return nextNum.toString().padStart(4, '0');
+	} catch (error) {
+		if (error.code === 'ENOENT') {
+			// If file doesn't exist, start with 0001
+			return '0001';
+		}
+		throw error;
+	}
+}
+
+// API Endpoints
+app.get('/api/visitors/next-serial', async (req, res) => {
+	try {
+		const nextSerial = await getNextSerialNumber();
+		res.json({ serialNumber: nextSerial });
+	} catch (error) {
+		logger.error('Error getting next serial number:', error);
+		res.status(500).json({
+			success: false,
+			error: 'Failed to get next serial number'
+		});
+	}
+});
+
+app.post('/api/visitors', upload.array('photos', 2), async (req, res) => {
+	try {
+		const visitorData = JSON.parse(req.body.visitorData);
+		validateVisitorData(visitorData);
+
+		// Read existing visitors
+		let visitors = [];
+		try {
+			const data = await fsPromises.readFile('data/visitors.json', 'utf8');
+			visitors = JSON.parse(data);
+		} catch (error) {
+			if (error.code !== 'ENOENT') throw error;
+		}
+
+		// Add new visitor
+		const newVisitor = {
+			...visitorData,
+			timeIn: new Date().toISOString(),
+			photos: req.files.map(file => file.filename)
+		};
+
+		visitors.push(newVisitor);
+
+		// Ensure data directory exists
+		await fsPromises.mkdir('data', { recursive: true });
+
+		// Save updated visitors
+		await fsPromises.writeFile('data/visitors.json', JSON.stringify(visitors, null, 2));
+
+		// Rename photo files to include serial number
+		for (const file of req.files) {
+			const ext = path.extname(file.filename);
+			const newFilename = `${visitorData.serialNumber}_${file.originalname}`;
+			await fsPromises.rename(
+				path.join('uploads', file.filename),
+				path.join('uploads', newFilename)
+			);
+		}
+
+		res.json({
+			success: true,
+			message: 'Visitor created successfully',
+			visitor: newVisitor
+		});
+
+	} catch (error) {
+		logger.error('Error creating visitor:', error);
+		// Delete uploaded files if there was an error
+		if (req.files) {
+			for (const file of req.files) {
+				try {
+					await fsPromises.unlink(path.join('uploads', file.filename));
+				} catch (unlinkError) {
+					logger.error('Error deleting photos:', unlinkError);
+				}
+			}
+		}
+		res.status(400).json({
+			success: false,
+			error: error.message || 'Failed to create visitor'
+		});
+	}
+});
+
+// Add timeout endpoint
+app.post('/api/visitors/:serialNumber/timeout', async (req, res) => {
+	try {
